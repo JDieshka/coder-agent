@@ -64,6 +64,16 @@ def chat(role: str, messages: list[dict]) -> str:
         }
         if rc.think is False and model.startswith("qwen3"):
             payload["think"] = False  # qwen3: отключаем reasoning-токены для экономии контекста
+        fmt = ""
+        for m in messages:
+            if m["role"] == "system":
+                fmt = m["content"]
+        wants_json = '"files"' in fmt or '"tasks"' in fmt or '"passed"' in fmt \
+                     or '"new_tasks"' in fmt or '"gaps"' in fmt
+        if wants_json:
+            # JSON-режим Ollama (grammar-constrained decoding): ответ всегда валидный JSON,
+            # переводы строк внутри content экранируются моделью принудительно
+            payload["format"] = "json"
         _log(f"role={role} model={model} msg_chars={sum(len(m['content']) for m in messages)}")
         t0 = time.time()
         try:
@@ -84,25 +94,183 @@ def chat(role: str, messages: list[dict]) -> str:
     raise LLMError(f"Все модели роли '{role}' исчерпаны. Последняя ошибка: {last_err}")
 
 
+def _balanced_slice(text: str, start: int, opener: str, closer: str) -> str | None:
+    """Возвращает сбалансированную по скобкам подстроку, игнорируя строки и экранирование."""
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _repair_json(s: str) -> str:
+    """Пытается починить типичные огрехи LLM-JSON: управляющие символы внутри строк."""
+    out, in_str, esc = [], False, False
+    for ch in s:
+        if in_str:
+            if esc:
+                esc = False
+                out.append(ch)
+                continue
+            if ch == "\\":
+                esc = True
+                out.append(ch)
+                continue
+            if ch == '"':
+                in_str = False
+                out.append(ch)
+                continue
+            if ch == "\n":
+                out.append("\\n")   # литеральный перевод строки внутри "..."
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            if ch == "\r":
+                continue
+            out.append(ch)
+        else:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+    return "".join(out)
+
+
+def _loads_maybe_repaired(candidate: str):
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return json.loads(_repair_json(candidate))
+
+
+def _looks_like_file_obj(o) -> bool:
+    return isinstance(o, dict) and "path" in o and "content" in o
+
+
+def _find_wrapped_obj(cleaned: str):
+    """Возвращает {...}-объект с обёрточными ключами (files/tasks/...), пропуская
+    вложенные объекты файлов вида {"path":...,"content":...}."""
+    WRAP_KEYS = {"files", "tasks", "new_tasks", "plan_md", "passed",
+                 "summary", "verdict", "notes"}
+    start = cleaned.find("{")
+    while start != -1:
+        slice_ = _balanced_slice(cleaned, start, "{", "}")
+        if slice_ is not None:
+            try:
+                obj = _loads_maybe_repaired(slice_)
+            except Exception:
+                obj = None
+            if isinstance(obj, dict) and (set(obj) & WRAP_KEYS or not _looks_like_file_obj(obj)):
+                return obj, start
+        nxt = cleaned.find("{", start + 1)
+        if nxt == start:
+            break
+        start = nxt
+    return None, -1
+
+
+def _truncate_to_last_complete_obj(text: str):
+    """Для обрезанного max_tokens массива файлов: берём все полные {...}-элементы."""
+    objs = []
+    i = 0
+    while True:
+        start = text.find("{", i)
+        if start == -1:
+            break
+        slice_ = _balanced_slice(text, start, "{", "}")
+        if slice_ is None:
+            break
+        try:
+            objs.append(_loads_maybe_repaired(slice_))
+        except Exception:
+            pass
+        i = start + len(slice_)
+    if objs and all(isinstance(o, dict) and o.get("path") for o in objs):
+        return {"files": objs, "notes": "(ответ был обрезан, взяты полные файлы)"}
+    return None
+
+
 def extract_json(text: str):
-    """Достаёт первый валидный JSON-объект/массив из ответа модели."""
-    text = re.sub(r"```(json)?", "", text)
-    # жёсткий поиск балансной {...} или [...]
-    for opener, closer in (("{", "}"), ("[", "]")):
-        start = text.find(opener)
-        while start != -1:
-            depth = 0
-            for i in range(start, len(text)):
-                if text[i] == opener:
-                    depth += 1
-                elif text[i] == closer:
-                    depth -= 1
-                    if depth == 0:
-                        candidate = text[start:i + 1]
-                        try:
-                            return json.loads(candidate)
-                        except json.JSONDecodeError:
-                            break
-            start = text.find(opener, start + 1)
-    # последний шанс: eval-подобный repair трюк с кавычками
+    """Достаёт первый валидный JSON-объект/массив из ответа модели.
+
+    Устойчив к: markdown-обёрткам, пояснениям до/после JSON, литеральным \\n
+    внутри строк кода, обрезанному ответу (заканчиваемся на ...)."""
+    cleaned = re.sub(r"```(json|python)?", "", text)
+
+    def _try_array_at(pos: int):
+        """Если с позиции pos начинается массив файлов/задач — вернуть его."""
+        if pos == -1:
+            return None
+        obj = _balanced_slice(cleaned, pos, "[", "]")
+        if obj is None:
+            return None
+        try:
+            parsed = _loads_maybe_repaired(obj)
+        except Exception:
+            return None
+        if (isinstance(parsed, list) and parsed
+                and all(isinstance(x, dict) for x in parsed)
+                and all(_looks_like_file_obj(x) or "id" in x or "title" in x for x in parsed)):
+            return parsed
+        return None
+
+    # 0) объект-обёртка {"files":...}/{"tasks":...} идёт в приоритете над голым массивом,
+    #    если он встречается РАНЬШЕ первого '[' (иначе это markdown-список внутри текста)
+    wrapped, wpos = _find_wrapped_obj(cleaned)
+    apos = cleaned.find("[")
+    # 1) голый массив [{"path":...},{"path":...}] — типичный ответ qwen3.5 на coder-запросе
+    arr = _try_array_at(apos)
+    if arr is not None and (wrapped is None or apos < wpos):
+        return arr
+    # 2) объект-обёртка {"files":...}/{"/tasks":...}/{"passed":...}
+    if wrapped is not None:
+        return wrapped
+    # 3) массив мог быть не распознан по первому '[' — пробуем следующие
+    while True:
+        nxt = cleaned.find("[", apos + 1)
+        if nxt == -1 or nxt == apos:
+            break
+        apos = nxt
+        arr = _try_array_at(apos)
+        if arr is not None:
+            return arr
+    # 4) любой валидный {...} как есть; но если это одиночный объект файла внутри
+    #    обрезанного {"files":[... — поднимаем его в корректную обёртку
+    start = cleaned.find("{")
+    while start != -1:
+        slice_ = _balanced_slice(cleaned, start, "{", "}")
+        if slice_ is not None:
+            try:
+                obj = _loads_maybe_repaired(slice_)
+            except Exception:
+                obj = None   # объект неполный (ответ обрезан) — идём дальше/к recovery
+            if isinstance(obj, dict):
+                if _looks_like_file_obj(obj) and '"files"' in cleaned[:start]:
+                    return {"files": [obj], "notes": "(ответ был обрезан, взят полный файл)"}
+                return obj
+        nxt = cleaned.find("{", start + 1)
+        if nxt == start:
+            break
+        start = nxt
+    # хвостовой шанс: JSON оборван лимитом токенов — собираем полные элементы
+    trimmed = _truncate_to_last_complete_obj(cleaned)
+    if trimmed is not None:
+        return trimmed
     raise LLMError(f"В ответе модели не найден JSON:\n{text[:500]}")
