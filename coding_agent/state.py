@@ -60,3 +60,19 @@ def load_progress_tail(n_lines: int = 40) -> str:
         return "".join(lines[-n_lines:])
     except OSError:
         return "(прогресс пуст)"
+
+
+# ---------- снапшот прогресс-бара (для resume между сессиями) ----------
+def save_bar_snapshot(snap: dict):
+    tmp = config.BAR_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(snap, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, config.BAR_FILE)
+
+
+def load_bar_snapshot() -> dict | None:
+    try:
+        with open(config.BAR_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None

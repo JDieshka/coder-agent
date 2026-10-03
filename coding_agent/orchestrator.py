@@ -6,14 +6,21 @@ import sys
 import time
 
 from . import config, context, llm, roles, state, tests_runner
+from .progress_bar import ProgressBar
 
 
 def _log(msg: str):
     ts = time.strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
+    # перед многострочным логом очищаем строку прогресс-бара, чтобы не было наложений
+    if _bar is not None and _bar._enabled:
+        _bar.clear()
     print(line, flush=True)
     with open(config.LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+_bar: ProgressBar | None = None  # инициализируется в Orchestrator.__init__
 
 
 def git(*args: str):
@@ -52,14 +59,45 @@ def dependency_code_for(task: dict, map_: str) -> str:
     return "\n\n".join(chunks)
 
 
+def _normalize_task(t: dict) -> dict:
+    """Гарантирует обязательные поля задачи (модель может их не вернуть)."""
+    t.setdefault("status", "pending")
+    t.setdefault("debug_rounds", 0)
+    t.setdefault("files", [])
+    t.setdefault("title", f"Задача #{t.get('id', '?')}")
+    return t
+
+
 class Orchestrator:
     def __init__(self, request: str):
+        global _bar
         self.request = request
         state.ensure_state()
         state.save_request(request)
         llm.check_models()
         self.plan_md = state.load_plan()
-        self.tasks = state.load_tasks()
+        self.tasks = [_normalize_task(t) for t in state.load_tasks()]
+        # прогресс-бар: состояние восстанавливаем из снапшота (resume между сессиями)
+        _bar = self.bar = ProgressBar(log_fn=_log)
+        if self.tasks:
+            self.bar.set_plan(self.tasks)
+        snap = state.load_bar_snapshot()
+        if snap and not self.tasks:
+            # план ещё не готов — показываем "0/?" и фазу плана
+            self.bar.phase = "plan"
+            self.bar._render(force=True)
+        elif snap and self.tasks:
+            # resume: total/done уже пересчитаны из tasks.json; таймер стартует заново
+            pass
+        else:
+            self.bar.phase = "plan"
+            self.bar._render(force=True)
+
+    def _save_bar(self):
+        try:
+            state.save_bar_snapshot(self.bar.snapshot())
+        except Exception:
+            pass
 
     # -------- фазы --------
     def phase_plan(self):
@@ -69,6 +107,7 @@ class Orchestrator:
         _log("=== Фаза PLANNER (qwen2.5-coder) ===")
         map_ = context.project_map()
         plan_md, tasks = roles.planner_create(self.request, map_)
+        tasks = [_normalize_task(t) for t in tasks]
         state.save_plan(plan_md)
         state.save_tasks(tasks)
         self.plan_md, self.tasks = plan_md, tasks
@@ -82,6 +121,7 @@ class Orchestrator:
 
     def _save(self):
         state.save_tasks(self.tasks)
+        self._save_bar()
 
     def phase_task_loop(self):
         while True:
@@ -91,6 +131,7 @@ class Orchestrator:
             task["status"] = "in_progress"
             self._save()
             _log(f"=== Задача #{task['id']}: {task['title']} ===")
+            self.bar.start_task(task)
             diagnosis = None
             accepted = False
             while not accepted:
@@ -104,9 +145,11 @@ class Orchestrator:
                 except llm.LLMError as e:
                     _log(f"Задача #{task['id']}: ошибка кодера ({str(e)[:150]}) — повтор")
                     task["debug_rounds"] += 1
+                    self.bar.debug_round(task["debug_rounds"])
                     if task["debug_rounds"] >= config.MAX_DEBUG_ROUNDS:
                         task["status"] = "failed"
                         self._save()
+                        self.bar.finish_task(task)
                         _log(f"Задача #{task['id']} провалена (ошибки формата ответа)")
                         break
                     diagnosis = f"Предыдущая попытка не удалась: {str(e)[:400]}. Верни СТРОГО валидный JSON."
@@ -125,9 +168,11 @@ class Orchestrator:
                 if not written:
                     diagnosis = "Кодер не записал ни одного файла. Верни файлы с корректными путями."
                     task["debug_rounds"] += 1
+                    self.bar.debug_round(task["debug_rounds"])
                     if task["debug_rounds"] >= config.MAX_DEBUG_ROUNDS:
                         task["status"] = "failed"
                         self._save()
+                        self.bar.finish_task(task)
                         _log(f"Задача #{task['id']} провалена (нет файлов)")
                         break
                     continue
@@ -152,6 +197,7 @@ class Orchestrator:
                     git("add", "-A"); git("commit", "-m", f"task #{task['id']}: {task['title']}")
                     self._save()
                     _log(f"Задача #{task['id']} ПРИНЯТА")
+                    self.bar.finish_task(task)
                 else:
                     task["debug_rounds"] += 1
                     diagnosis = (diag or "") + ("\nРЕАЛЬНЫЕ ОШИБКИ:\n" + hard_out if not hard_ok else "")
@@ -160,11 +206,14 @@ class Orchestrator:
                         task["status"] = "failed"
                         self._save()
                         _log(f"Задача #{task['id']} ПРОВАЛЕНА после {config.MAX_DEBUG_ROUNDS} раундов")
+                        self.bar.finish_task(task)
                         break
                     _log(f"Задача #{task['id']} раунд отладки {task['debug_rounds']}")
+                    self.bar.debug_round(task["debug_rounds"])
             # если задача упала — цикл продолжится со следующей pending
 
     def phase_replan(self):
+        self.bar.set_phase("replan")
         failed = [t for t in self.tasks if t["status"] == "failed"]
         done = [t for t in self.tasks if t["status"] == "done"]
         if not done:
@@ -178,7 +227,7 @@ class Orchestrator:
             _log(f"Ре-план не удался ({str(e)[:150]}) — пропускаю, идем к сверке.")
             new = []
         existing_ids = {t["id"] for t in self.tasks}
-        added = [t for t in new if t["id"] not in existing_ids]
+        added = [_normalize_task(t) for t in new if t["id"] not in existing_ids]
         for t in failed:
             t["status"] = "pending"; t["debug_rounds"] = 0  # второй шанс после реплана
         if added:
@@ -187,8 +236,10 @@ class Orchestrator:
         else:
             _log("Новых задач нет.")
         self._save()
+        self.bar.set_plan(self.tasks)
 
     def phase_audit(self):
+        self.bar.set_phase("audit")
         _log("=== Финальная сверка результата с планом (Auditor=qwen3:8b) ===")
         try:
             result = roles.auditor_check(self.plan_md, tasks_status_str(self.tasks),
@@ -216,7 +267,10 @@ class Orchestrator:
 
     # -------- публичный API --------
     def run(self):
+        self.bar.set_phase("plan")
         self.phase_plan()
+        if self.tasks:
+            self.bar.set_plan(self.tasks)
         try:
             self.phase_task_loop()
             self.phase_replan()
@@ -237,7 +291,16 @@ class Orchestrator:
             self._save()
             raise
         done = sum(1 for t in self.tasks if t["status"] == "done")
+        failed = sum(1 for t in self.tasks if t["status"] == "failed")
+        self.bar.done_tasks = done
+        self.bar.total_tasks = len(self.tasks)
+        self.bar.phase = "audit"
+        self.bar.print_final(
+            f"[100%] {'█' * 40} {done + failed}/{len(self.tasks)} | ГОТОВО={done} ПРОВАЛ={failed} "
+            f"| ⏱ {self.bar.elapsed()} | ЗАВЕРШЕНО. См. {config.AUDIT_FILE}"
+        )
         _log(f"ЗАВЕРШЕНО: задач выполнено {done}/{len(self.tasks)}. См. {config.AUDIT_FILE}")
+        self._save_bar()
         return {"done": done, "total": len(self.tasks), "gaps": len(gaps)}
 
 

@@ -49,6 +49,7 @@ TASKS_FILE = ""
 PROGRESS_FILE = ""
 AUDIT_FILE = ""
 LOG_FILE = ""
+BAR_FILE = ""
 
 
 def slugify(text: str, max_len: int = 40) -> str:
@@ -87,7 +88,7 @@ def make_project_id(base: str) -> str:
 def init_paths(project_dir: str):
     """Фиксирует рабочий каталог проекта и все пути состояния относительно него."""
     global PROJECT_DIR, STATE_DIR, PLAN_FILE, TASKS_FILE
-    global PROGRESS_FILE, AUDIT_FILE, LOG_FILE
+    global PROGRESS_FILE, AUDIT_FILE, LOG_FILE, BAR_FILE
     PROJECT_DIR = project_dir
     STATE_DIR = os.path.join(PROJECT_DIR, "agent_state")
     PLAN_FILE = os.path.join(STATE_DIR, "plan.md")
@@ -95,6 +96,7 @@ def init_paths(project_dir: str):
     PROGRESS_FILE = os.path.join(STATE_DIR, "progress.md")
     AUDIT_FILE = os.path.join(STATE_DIR, "audit_report.md")
     LOG_FILE = os.path.join(STATE_DIR, "run.log")
+    BAR_FILE = os.path.join(STATE_DIR, "bar.json")
 
 
 def find_existing_project(request: str) -> str | None:
