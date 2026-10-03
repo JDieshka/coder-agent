@@ -59,10 +59,12 @@ class ProgressBar:
     # ---------- публичные события ----------
     def set_plan(self, tasks: list[dict]):
         """Синхронизирует счётчики с актуальным tasks.json (идемпотентно для resume/replan)."""
-        self.total_tasks = len(tasks)
-        self.done_tasks = sum(1 for t in tasks if t.get("status") == "done")
+        # skipped-задачи не участвуют в прогрессе вообще
+        active = [t for t in tasks if t.get("status") != "skipped"]
+        self.total_tasks = len(active)
+        self.done_tasks = sum(1 for t in active if t.get("status") == "done")
         # failed тоже пересчитываем из задач — иначе при повторных вызовах счётчик накапливался
-        self._failed = sum(1 for t in tasks if t.get("status") == "failed")
+        self._failed = sum(1 for t in active if t.get("status") == "failed")
         # флаги «уже засчитана» синхронизируем со статусами: done/failed -> True,
         # возвращённая в pending задача (реплан) сбрасывает флаг и будет засчитана заново
         for t in tasks:

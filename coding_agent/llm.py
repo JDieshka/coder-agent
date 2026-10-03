@@ -248,6 +248,8 @@ def _truncate_to_last_complete_obj(text: str):
             pass
         i = start + len(slice_)
     if objs and all(isinstance(o, dict) and o.get("path") for o in objs):
+        # один полный файл -> {"files":[obj]} (roles.coder_generate сам поднимет одиночный объект);
+        # несколько -> список, который roles принимают как голый массив файлов
         return {"files": objs, "notes": "(ответ был обрезан, взяты полные файлы)"}
     return None
 
@@ -284,6 +286,12 @@ def extract_json(text: str):
     arr = _try_array_at(apos)
     if arr is not None and (wrapped is None or apos < wpos):
         return arr
+    # 1b) массив оборван лимитом токенов (нет закрывающего ']') — собираем полные элементы;
+    #     иначе ниже по коду одиночный полный {...} внутри него ложно считается целым ответом
+    if apos != -1 and _balanced_slice(cleaned, apos, "[", "]") is None:
+        trimmed0 = _truncate_to_last_complete_obj(cleaned[apos:])
+        if trimmed0 is not None:
+            return trimmed0
     # 2) объект-обёртка {"files":...}/{"/tasks":...}/{"passed":...}
     if wrapped is not None:
         return wrapped

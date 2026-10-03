@@ -92,9 +92,11 @@ def _normalize_task(t: dict) -> dict:
 
 
 class Orchestrator:
-    def __init__(self, request: str):
+    def __init__(self, request: str, step_mode: bool = False, review_plan: bool = False):
         global _bar
         self.request = request
+        self.step_mode = step_mode
+        self.review_plan = review_plan
         state.ensure_state()
         state.save_request(request)
         llm.check_models()
@@ -142,6 +144,57 @@ class Orchestrator:
         state.save_tasks(tasks)
         self.plan_md, self.tasks = plan_md, tasks
         _log(f"План сохранён, задач: {len(tasks)}")
+        if self.review_plan:
+            self._confirm_plan()
+
+    def _confirm_plan(self):
+        """Интерактивное подтверждение плана (--review-plan). Пайп/не-TTY — авто-продолжение."""
+        print("\n" + "=" * 60)
+        print("ПЛАН РЕАЛИЗАЦИИ:")
+        print("=" * 60)
+        print(self.plan_md)
+        print("=" * 60)
+        print("Задачи:")
+        print(tasks_status_str(self.tasks))
+        print("=" * 60)
+        if not sys.stdin.isatty():
+            _log("--review-plan: stdin не интерактивный — продолжаю автоматически.")
+            return
+        while True:
+            try:
+                ans = input("Подтвердить план? [y]/edit <правка>/skip <id,...>/quit: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "y"
+            if ans in ("", "y", "yes", "д", "да"):
+                return
+            if ans == "quit":
+                _log("Пользователь отменил запуск. Состояние сохранено — продолжите той же командой.")
+                raise SystemExit(0)
+            if ans.startswith("skip"):
+                ids = {int(x) for x in ans[4:].replace(",", " ").split() if x.strip().lstrip("-").isdigit()}
+                for t in self.tasks:
+                    if t["id"] in ids:
+                        t["status"] = "skipped"
+                self._save()
+                _log(f"Пропущено задач: {sorted(ids)}")
+                return
+            if ans.startswith("edit"):
+                # правка текстом: "edit #3 заменить на ..." — применяем к описанию задачи
+                parts = ans.split("#", 1)
+                if len(parts) == 2:
+                    num, rest = parts[1].split(" ", 1)
+                    try:
+                        tid = int(num)
+                    except ValueError:
+                        _log("Формат: edit #<id> <новое описание>")
+                        continue
+                    for t in self.tasks:
+                        if t["id"] == tid:
+                            t["description"] = rest.strip()
+                            _log(f"Задача #{tid}: описание обновлено")
+                    self._save()
+                continue
+            _log("Команды: y (подтвердить), edit #<id> <текст>, skip <id,id>, quit")
 
     def _next_pending(self) -> dict | None:
         for t in self.tasks:
@@ -248,6 +301,9 @@ class Orchestrator:
                     _log(f"Задача #{task['id']} раунд отладки {task['debug_rounds']}")
                     self.bar.debug_round(task["debug_rounds"])
             # если задача упала — цикл продолжится со следующей pending
+            if self.step_mode:
+                _log("Режим --step: задача завершена, останавливаюсь. Продолжи той же командой с --step.")
+                return
 
     def phase_replan(self):
         self.bar.set_phase("replan")
@@ -352,20 +408,195 @@ def _early_log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# ---------- CLI-подкоманды: list / status / diff / reset-task ----------
+def _list_projects() -> int:
+    root = config.WORKFLOW_ROOT
+    if not os.path.isdir(root):
+        print("Папка workflow/ не найдена — проектов ещё нет.")
+        return 0
+    rows = []
+    for name in sorted(os.listdir(root)):
+        d = os.path.join(root, name)
+        st = os.path.join(d, "agent_state")
+        if not os.path.isdir(st):
+            continue
+        try:
+            tasks = json.load(open(os.path.join(st, "tasks.json"), encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            tasks = []
+        done = sum(1 for t in tasks if t.get("status") == "done")
+        failed = sum(1 for t in tasks if t.get("status") == "failed")
+        req_f = os.path.join(st, "request.txt")
+        req = open(req_f, encoding="utf-8").read().strip()[:50] if os.path.isfile(req_f) else ""
+        audit = "есть" if os.path.isfile(os.path.join(st, "audit_report.md")) else "-"
+        rows.append((name, f"{done}/{len(tasks)}", failed, audit, req))
+    if not rows:
+        print("Проектов нет.")
+        return 0
+    w = max(len(r[0]) for r in rows)
+    print(f"{'ПРОЕКТ'.ljust(w)}  {'ГОТОВО':7}  ПРОВАЛ  ОТЧЁТ  ЗАПРОС")
+    for name, prog, failed, audit, req in rows:
+        print(f"{name.ljust(w)}  {prog:7}  {failed:^5}  {audit:^5}  {req}")
+    return 0
+
+
+def _resolve_project(name_or_request: str) -> str | None:
+    """Папка проекта по имени в workflow/ либо по совпадению запроса."""
+    cand = os.path.join(config.WORKFLOW_ROOT, name_or_request)
+    if os.path.isdir(cand):
+        return cand
+    found = config.find_existing_project(name_or_request)
+    if found:
+        return found
+    # частичное совпадение имени папки
+    if os.path.isdir(config.WORKFLOW_ROOT):
+        matches = [n for n in os.listdir(config.WORKFLOW_ROOT) if name_or_request in n]
+        if len(matches) == 1:
+            return os.path.join(config.WORKFLOW_ROOT, matches[0])
+        if len(matches) > 1:
+            print(f"Неоднозначно ({', '.join(matches)}) — уточни имя.")
+            return None
+    return None
+
+
+def _status_project(name_or_request: str) -> int:
+    proj = _resolve_project(name_or_request)
+    if not proj:
+        print(f"Проект не найден: {name_or_request}")
+        return 1
+    tf = os.path.join(proj, "agent_state", "tasks.json")
+    try:
+        tasks = json.load(open(tf, encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        print(f"{proj}: задач нет (план ещё не создан)")
+        return 0
+    icons = {"pending": "⏳", "in_progress": "🔨", "done": "✅", "failed": "❌", "skipped": "⏭"}
+    print(f"Проект: {proj}")
+    for t in tasks:
+        icon = icons.get(t.get("status"), "?")
+        rounds = t.get("debug_rounds", 0)
+        extra = f" (раунды отладки: {rounds})" if rounds else ""
+        print(f"  {icon} #{t.get('id')}: {t.get('title')}{extra}")
+    done = sum(1 for t in tasks if t.get("status") == "done")
+    print(f"Итого: {done}/{len(tasks)} выполнено")
+    return 0
+
+
+def _diff_project(name_or_request: str, task_id: int | None) -> int:
+    proj = _resolve_project(name_or_request)
+    if not proj:
+        print(f"Проект не найден: {name_or_request}")
+        return 1
+    cmd = ["git", "-C", proj, "log", "--oneline"]
+    if task_id is not None:
+        cmd += ["--grep", f"task #{task_id}:", "-1"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        print("git-история пуста или git недоступен.")
+        return 1
+    commits = r.stdout.strip().splitlines()
+    if not commits:
+        print("Коммитов не найдено.")
+        return 0
+    if task_id is None:
+        print("История коммитов (--diff <проект> <id> — показать изменения задачи):")
+        print(r.stdout)
+        return 0
+    last = commits[-1].split()[0]
+    prev_cmd = ["git", "-C", proj, "log", "--format=%H", "--grep", f"task #{task_id}:", "-2"]
+    hashes = subprocess.run(prev_cmd, capture_output=True, text=True, timeout=30).stdout.split()
+    base = hashes[1] if len(hashes) > 1 else hashes[0] + "^"
+    show = subprocess.run(["git", "-C", proj, "show", "--stat", "-p", last if len(hashes) == 1 else base],
+                          capture_output=True, text=True, timeout=60)
+    print(show.stdout or "(пусто)")
+    return 0
+
+
+def _reset_task(name_or_request: str, task_id: int) -> int:
+    proj = _resolve_project(name_or_request)
+    if not proj:
+        print(f"Проект не найден: {name_or_request}")
+        return 1
+    tf = os.path.join(proj, "agent_state", "tasks.json")
+    try:
+        tasks = json.load(open(tf, encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        print("tasks.json не найден/битый.")
+        return 1
+    changed = False
+    for t in tasks:
+        if t.get("id") == task_id:
+            t["status"] = "pending"
+            t["debug_rounds"] = 0
+            changed = True
+    if not changed:
+        print(f"Задача #{task_id} не найдена.")
+        return 1
+    tmp = tf + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, tf)
+    bf = os.path.join(proj, "agent_state", "bar.json")
+    if os.path.isfile(bf):
+        try:
+            snap = json.load(open(bf, encoding="utf-8"))
+            snap.pop(f"_counted_{task_id}", None)
+            json.dump(snap, open(bf, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        except (OSError, json.JSONDecodeError):
+            pass
+    print(f"Задача #{task_id} сброшена в pending. Запусти агент с --resume {os.path.basename(proj)}")
+    return 0
+
+
 def main(argv: list[str] | None = None):
     import argparse
     parser = argparse.ArgumentParser(
         prog="python -m coding_agent",
         description='Кодер-агент: план -> код -> тесты -> сверка (ротация моделей через Ollama).',
     )
-    parser.add_argument("request", help='описание проекта, например "Напиши чат-приложение..."')
-    parser.add_argument("--name", metavar="SLUG", default=None,
-                        help="имя папки проекта в workflow/ (по умолчанию — из запроса)")
-    parser.add_argument("--fresh", action="store_true",
-                        help="не подхватывать существующий проект; начать с чистой страницы")
-    parser.add_argument("--resume", metavar="NAME", nargs="?", const="", default=None,
-                        help="продолжить проект по имени папки в workflow/ (без имени — поиск по запросу)")
-    args = parser.parse_args(argv)
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_run = sub.add_parser("run", help="запустить/продолжить проект (по умолчанию)")
+    p_run.add_argument("request", help='описание проекта, например "Напиши чат-приложение..."')
+    p_run.add_argument("--name", metavar="SLUG", default=None,
+                       help="имя папки проекта в workflow/ (по умолчанию — из запроса)")
+    p_run.add_argument("--fresh", action="store_true",
+                       help="не подхватывать существующий проект; начать с чистой страницы")
+    p_run.add_argument("--resume", metavar="NAME", nargs="?", const="", default=None,
+                       help="продолжить проект по имени папки в workflow/ (без имени — поиск по запросу)")
+    p_run.add_argument("--step", action="store_true",
+                       help="выполнить одну задачу и остановиться (повторный запуск продолжит)")
+    p_run.add_argument("--review-plan", action="store_true", dest="review_plan",
+                       help="показать план после Planner и спросить подтверждение (y/edit/skip/quit)")
+
+    sub.add_parser("list", help="список проектов в workflow/ с прогрессом")
+
+    p_st = sub.add_parser("status", help="статус задач проекта")
+    p_st.add_argument("project", help="имя папки проекта или текст запроса")
+
+    p_df = sub.add_parser("diff", help="git-история проекта или изменения конкретной задачи")
+    p_df.add_argument("project", help="имя папки проекта или текст запроса")
+    p_df.add_argument("task", nargs="?", type=int, default=None, help="id задачи")
+
+    p_rs = sub.add_parser("reset-task", help="вернуть задачу в pending (после провала)")
+    p_rs.add_argument("project", help="имя папки проекта или текст запроса")
+    p_rs.add_argument("task", type=int, help="id задачи")
+
+    # обратная совместимость: python -m coding_agent "запрос" == run "запрос"
+    known = {"run", "list", "status", "diff", "reset-task"}
+    args_list = list(argv) if argv is not None else sys.argv[1:]
+    if not args_list or args_list[0] not in known:
+        args_list = ["run"] + args_list
+    args = parser.parse_args(args_list)
+
+    if args.cmd == "list":
+        raise SystemExit(_list_projects())
+    if args.cmd == "status":
+        raise SystemExit(_status_project(args.project))
+    if args.cmd == "diff":
+        raise SystemExit(_diff_project(args.project, args.task))
+    if args.cmd == "reset-task":
+        raise SystemExit(_reset_task(args.project, args.task))
 
     request = args.request
     fresh = args.fresh
@@ -409,7 +640,7 @@ def main(argv: list[str] | None = None):
         git("commit", "-m", "init")
     _log(f"Каталог проекта: {os.path.abspath(config.PROJECT_DIR)}")
 
-    orch = Orchestrator(request)
+    orch = Orchestrator(request, step_mode=args.step, review_plan=args.review_plan)
     res = orch.run()
     print(json.dumps(res, ensure_ascii=False))
 
