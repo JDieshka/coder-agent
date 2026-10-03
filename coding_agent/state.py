@@ -6,10 +6,18 @@ from . import config
 
 
 def ensure_state():
+    os.makedirs(config.PROJECT_DIR, exist_ok=True)
     os.makedirs(config.STATE_DIR, exist_ok=True)
     for f in (config.LOG_FILE,):
         if not os.path.exists(f):
             open(f, "w").close()
+
+
+def save_request(request: str):
+    req = os.path.join(config.STATE_DIR, "request.txt")
+    if not os.path.exists(req):
+        with open(req, "w", encoding="utf-8") as f:
+            f.write(request.strip() + "\n")
 
 
 def save_plan(text: str):

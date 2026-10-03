@@ -17,8 +17,10 @@ def _log(msg: str):
 
 
 def git(*args: str):
+    """git внутри каталога проекта (workflow/<project>)."""
     try:
-        subprocess.run(["git", *args], check=False, capture_output=True, timeout=30)
+        subprocess.run(["git", *args], check=False, capture_output=True, timeout=30,
+                       cwd=config.PROJECT_DIR or ".")
     except Exception:
         pass  # git не обязателен
 
@@ -54,6 +56,7 @@ class Orchestrator:
     def __init__(self, request: str):
         self.request = request
         state.ensure_state()
+        state.save_request(request)
         llm.check_models()
         self.plan_md = state.load_plan()
         self.tasks = state.load_tasks()
@@ -95,8 +98,20 @@ class Orchestrator:
                 map_ = context.project_map()
                 dep = dependency_code_for(task, map_)
                 progress = state.load_progress_tail()
-                files, notes = roles.coder_generate(task, self.plan_md, map_, dep,
-                                                    progress, diagnosis)
+                try:
+                    files, notes = roles.coder_generate(task, self.plan_md, map_, dep,
+                                                        progress, diagnosis)
+                except llm.LLMError as e:
+                    _log(f"Задача #{task['id']}: ошибка кодера ({str(e)[:150]}) — повтор")
+                    task["debug_rounds"] += 1
+                    if task["debug_rounds"] >= config.MAX_DEBUG_ROUNDS:
+                        task["status"] = "failed"
+                        self._save()
+                        _log(f"Задача #{task['id']} провалена (ошибки формата ответа)")
+                        break
+                    diagnosis = f"Предыдущая попытка не удалась: {str(e)[:400]}. Верни СТРОГО валидный JSON."
+                    self._save()
+                    continue
                 written = []
                 for f in files:
                     path, content = f.get("path"), f.get("content")
@@ -124,7 +139,12 @@ class Orchestrator:
                 snippets = "\n\n".join(
                     f"--- {p} ---\n{context.read_file(p)[:1500]}" for p in written
                 )
-                passed, diag = roles.tester_judge(task, written, hard_out, snippets)
+                try:
+                    passed, diag = roles.tester_judge(task, written, hard_out, snippets)
+                except llm.LLMError as e:
+                    # не роняем процесс: при ошибке формата доверяемся реальным проверкам
+                    _log(f"Задача #{task['id']}: ошибка тестера ({str(e)[:150]}) — решающий exit code")
+                    passed, diag = True, ""
                 accepted = hard_ok and passed
                 if accepted:
                     task["status"] = "done"
@@ -151,8 +171,12 @@ class Orchestrator:
             _log("Ни одна задача не выполнена — реплан не нужен.")
             return
         _log("=== Ре-план: новые мелкие задачи по пробелам ===")
-        new = roles.planner_replan(self.plan_md, tasks_status_str(self.tasks),
-                                   state.load_progress_tail(), context.project_map())
+        try:
+            new = roles.planner_replan(self.plan_md, tasks_status_str(self.tasks),
+                                       state.load_progress_tail(), context.project_map())
+        except llm.LLMError as e:
+            _log(f"Ре-план не удался ({str(e)[:150]}) — пропускаю, идем к сверке.")
+            new = []
         existing_ids = {t["id"] for t in self.tasks}
         added = [t for t in new if t["id"] not in existing_ids]
         for t in failed:
@@ -166,8 +190,18 @@ class Orchestrator:
 
     def phase_audit(self):
         _log("=== Финальная сверка результата с планом (Auditor=qwen3:8b) ===")
-        result = roles.auditor_check(self.plan_md, tasks_status_str(self.tasks),
-                                     context.project_map(), state.load_progress_tail(20))
+        try:
+            result = roles.auditor_check(self.plan_md, tasks_status_str(self.tasks),
+                                         context.project_map(), state.load_progress_tail(20))
+        except llm.LLMError as e:
+            _log(f"Auditor не смог вернуть JSON ({str(e)[:150]}) — механическая сверка по статусам.")
+            done = [t for t in self.tasks if t["status"] == "done"]
+            failed = [t for t in self.tasks if t["status"] != "done"]
+            result = {
+                "summary": f"Механическая сверка: принято {len(done)} из {len(self.tasks)} задач.",
+                "covered": [f"#{t['id']} {t['title']}" for t in done],
+                "gaps": [f"#{t['id']} {t['title']} (статус: {t['status']})" for t in failed],
+            }
         with open(config.AUDIT_FILE, "w", encoding="utf-8") as f:
             f.write("# Отчёт о сверке с планом\n\n")
             f.write(f"**Итог:** {result.get('summary','')}\n\n## Реализовано\n")
@@ -183,32 +217,79 @@ class Orchestrator:
     # -------- публичный API --------
     def run(self):
         self.phase_plan()
-        self.phase_task_loop()
-        self.phase_replan()
-        self.phase_task_loop()   # добиваем новые/возвращённые задачи
-        gaps = self.phase_audit()
-        if gaps:
-            _log("Есть пробелы — один дополнительный цикл реплана.")
-            self.phase_replan()
+        try:
             self.phase_task_loop()
+            self.phase_replan()
+            self.phase_task_loop()   # добиваем новые/возвращённые задачи
             gaps = self.phase_audit()
+            if gaps:
+                _log("Есть пробелы — один дополнительный цикл реплана.")
+                self.phase_replan()
+                self.phase_task_loop()
+                gaps = self.phase_audit()
+        except llm.LLMError as e:
+            # Ollama недоступен/OOM/таймаут — сохраняем состояние,resume продолжит сессией позже
+            _log(f"Фатальная ошибка LLM: {e}")
+            _log("Состояние сохранено — продолжите той же командой (resume).")
+            for t in self.tasks:
+                if t["status"] == "in_progress":
+                    t["status"] = "pending"
+            self._save()
+            raise
         done = sum(1 for t in self.tasks if t["status"] == "done")
         _log(f"ЗАВЕРШЕНО: задач выполнено {done}/{len(self.tasks)}. См. {config.AUDIT_FILE}")
         return {"done": done, "total": len(self.tasks), "gaps": len(gaps)}
 
 
+def _early_log(msg: str):
+    """Лог до выбора проекта (config.LOG_FILE ещё не определён)."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
 def main():
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2 or sys.argv[1].startswith("-"):
         print(__doc__ or "")
-        print('usage: python -m coding_agent "описание проекта" [--fresh]')
+        print('usage: python -m coding_agent "описание проекта" [--name my-app] [--fresh]')
         sys.exit(1)
     request = sys.argv[1]
     fresh = "--fresh" in sys.argv
+
+    # имя проекта: --name <slug> или автоматический slug из запроса
+    name = None
+    if "--name" in sys.argv:
+        i = sys.argv.index("--name")
+        if i + 1 < len(sys.argv):
+            name = config.slugify(sys.argv[i + 1])
+
+    if not fresh:
+        existing = config.find_existing_project(request)
+        if existing:
+            config.init_paths(existing)
+            _early_log(f"Продолжаю существующий проект: {existing}/")
+        elif name and os.path.isdir(os.path.join(config.WORKFLOW_ROOT, name)):
+            config.init_paths(os.path.join(config.WORKFLOW_ROOT, name))
+            _early_log(f"Продолжаю проект по имени: {config.PROJECT_DIR}/")
+    if not config.PROJECT_DIR:
+        pid = name or config.slugify(request)
+        pid = config.make_project_id(pid)
+        project_dir = os.path.join(config.WORKFLOW_ROOT, pid)
+        config.init_paths(project_dir)
+        _early_log(f"Новый проект: {project_dir}/")
+
     if fresh:
         for f in (config.PLAN_FILE, config.TASKS_FILE, config.PROGRESS_FILE, config.AUDIT_FILE):
             if os.path.exists(f):
                 os.remove(f)
         print("Состояние очищено (--fresh).")
+
+    os.makedirs(config.PROJECT_DIR, exist_ok=True)
+    tests_runner.PROJECT_CWD = config.PROJECT_DIR   # все проверки идут внутри проекта
+    if not os.path.isdir(os.path.join(config.PROJECT_DIR, ".git")):
+        git("init")
+        git("add", "-A")
+        git("commit", "-m", "init")
+    _log(f"Каталог проекта: {os.path.abspath(config.PROJECT_DIR)}")
+
     orch = Orchestrator(request)
     res = orch.run()
     print(json.dumps(res, ensure_ascii=False))

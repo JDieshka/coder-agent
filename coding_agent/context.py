@@ -13,21 +13,28 @@ def approx_tokens(s: str) -> int:
     return int(len(s) / 3.8) + 1
 
 
-def project_map(root: str = ".") -> str:
+def project_path(path: str) -> str:
+    """Абсолютный/относительный путь файла проекта от корня проекта."""
+    return os.path.join(config.PROJECT_DIR, path.replace("\\", "/"))
+
+
+def project_map() -> str:
+    root = config.PROJECT_DIR or "."
     lines = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
-        rel = os.path.relpath(dirpath, root)
+        rel = os.path.relpath(dirpath, root).replace("\\", "/")
         for fn in sorted(filenames):
             if fn.endswith((".py", ".md", ".txt", ".json", ".html", ".css", ".js")):
                 p = os.path.join(dirpath, fn)
+                rp = f"{rel}/{fn}" if rel != "." else fn
                 try:
                     src = open(p, encoding="utf-8").read()
                 except (OSError, UnicodeDecodeError):
                     continue
                 sig = _py_signature(src) if fn.endswith(".py") else ""
                 size = len(src.splitlines())
-                lines.append(f"{p} ({size} строк){sig}")
+                lines.append(f"{rp} ({size} строк){sig}")
     return "\n".join(lines) if lines else "(пусто)"
 
 
@@ -51,15 +58,16 @@ def _py_signature(src: str) -> str:
 
 def read_file(path: str) -> str:
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(project_path(path), encoding="utf-8") as f:
             return f.read()
     except OSError:
         return ""
 
 
 def write_file(path: str, content: str):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    full = project_path(path)
+    os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+    with open(full, "w", encoding="utf-8") as f:
         f.write(content)
 
 
