@@ -3,7 +3,7 @@ import os
 import re
 from dataclasses import dataclass
 
-OLLAMA_URL = "http://localhost:11434"
+OLLAMA_URL = os.environ.get("CODER_AGENT_OLLAMA_URL", "http://localhost:11434")
 
 # Модели, которые будут использоваться (должны быть в `ollama pull`).
 MODEL_PLANNER = "qwen2.5-coder:7b-instruct-q4_K_M"   # пишет план и декомпозицию
@@ -29,8 +29,11 @@ ROLES = {
 }
 
 # Жёсткий бюджет контекста (RTX 4060 8GB + 16GB RAM).
-CTX_WINDOW = 16384
-MAX_PROMPT_TOKENS = 11000     # резерв под completion и KV-кэш
+# CTX_WINDOW переопределяется env CODER_AGENT_CTX (например, CODER_AGENT_CTX=8192
+# при нехватке VRAM; MAX_PROMPT_TOKENS автоматически подстрачивается ниже).
+CTX_WINDOW = int(os.environ.get("CODER_AGENT_CTX", "16384"))
+MAX_PROMPT_TOKENS = min(int(os.environ.get("CODER_AGENT_MAX_TOKENS", "11000")),
+                        max(512, CTX_WINDOW - 4000))  # резерв под completion и KV-кэш
 KEEP_ALIVE = "0"              # немедленная выгрузка модели -> ротация ролей без OOM
 
 MAX_DEBUG_ROUNDS = 3          # циклов coder->tester на одну задачу
