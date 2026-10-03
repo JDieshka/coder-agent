@@ -63,6 +63,10 @@ class ProgressBar:
         self.done_tasks = sum(1 for t in tasks if t.get("status") == "done")
         # failed тоже пересчитываем из задач — иначе при повторных вызовах счётчик накапливался
         self._failed = sum(1 for t in tasks if t.get("status") == "failed")
+        # флаги «уже засчитана» синхронизируем со статусами: done/failed -> True,
+        # возвращённая в pending задача (реплан) сбрасывает флаг и будет засчитана заново
+        for t in tasks:
+            setattr(self, f"_counted_{t['id']}", t.get("status") in ("done", "failed"))
         self._render(force=True)
 
     def start_task(self, task: dict):
@@ -74,10 +78,14 @@ class ProgressBar:
 
     def finish_task(self, task: dict):
         st = task.get("status")
-        if st == "done":
+        # идемпотентность: счётчик ведём по статусу задачи (set_plan пересчитывает из tasks.json);
+        # повторный вызов для той же задачи не должен завышать прогресс
+        if st == "done" and not getattr(self, f"_counted_{task['id']}", False):
             self.done_tasks += 1
-        elif st == "failed":
-            self.mark_failed()
+            setattr(self, f"_counted_{task['id']}", True)
+        elif st == "failed" and not getattr(self, f"_counted_{task['id']}", False):
+            self._failed = getattr(self, "_failed", 0) + 1
+            setattr(self, f"_counted_{task['id']}", True)
         self.current_task_id = 0
         self.current_title = ""
         self.phase = "pending"
@@ -103,12 +111,8 @@ class ProgressBar:
         return self.done_tasks + self.failed_count()
 
     def failed_count(self) -> int:
-        # считаем из total/done/pending; pending+in_progress не трогем
-        # но нам нужен точный счётчик — храним отдельно
+        # точный счётчик храним отдельно; set_plan()/finish_task() держат его синхронно
         return getattr(self, "_failed", 0)
-
-    def mark_failed(self):
-        self._failed = getattr(self, "_failed", 0) + 1
 
     # ---------- рендер ----------
     def _bar_str(self, ratio: float, width: int) -> str:
