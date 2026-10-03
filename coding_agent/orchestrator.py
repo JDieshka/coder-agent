@@ -23,6 +23,29 @@ def _log(msg: str):
 _bar: ProgressBar | None = None  # инициализируется в Orchestrator.__init__
 
 
+def _wait_with_heartbeat(fn, phase_label: str, interval: float = 5.0):
+    """Ждёт завершения fn() (llm.chat блокирует поток), обновляя таймер прогресс-бара,
+    чтобы во время долгой генерации строка не выглядела зависшей."""
+    box: dict = {}
+
+    def worker():
+        try:
+            box["result"] = fn()
+        except BaseException as e:   # noqa: BLE001 — пробрасываем в основной поток
+            box["error"] = e
+
+    import threading
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    while t.is_alive():
+        t.join(interval)
+        if _bar is not None and _bar._enabled:
+            _bar.tick(phase_label)
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
 def git(*args: str):
     """git внутри каталога проекта (workflow/<project>)."""
     try:
@@ -77,19 +100,25 @@ class Orchestrator:
         llm.check_models()
         self.plan_md = state.load_plan()
         self.tasks = [_normalize_task(t) for t in state.load_tasks()]
+        # crash-resume: если прошлая сессия упала на задаче in_progress — возвращаем её в pending
+        resumed = [t["id"] for t in self.tasks if t["status"] == "in_progress"]
+        for t in self.tasks:
+            if t["status"] == "in_progress":
+                t["status"] = "pending"
+        if resumed:
+            _log(f"Crash-resume: задачи {resumed} были прерваны — статус сброшен в pending")
+            self._save()
         # прогресс-бар: состояние восстанавливаем из снапшота (resume между сессиями)
         _bar = self.bar = ProgressBar(log_fn=_log)
-        if self.tasks:
-            self.bar.set_plan(self.tasks)
         snap = state.load_bar_snapshot()
-        if snap and not self.tasks:
-            # план ещё не готов — показываем "0/?" и фазу плана
-            self.bar.phase = "plan"
-            self.bar._render(force=True)
-        elif snap and self.tasks:
-            # resume: total/done уже пересчитаны из tasks.json; таймер стартует заново
-            pass
+        if self.tasks:
+            # total/done/failed пересчитываются из актуального tasks.json (надёжнее снапшота);
+            # restore() возвращает фазу/таймер прошлой сессии для корректного ETA
+            if snap:
+                self.bar.restore(snap)
+            self.bar.set_plan(self.tasks)
         else:
+            # план ещё не готов — показываем "0/?" и фазу плана
             self.bar.phase = "plan"
             self.bar._render(force=True)
 
@@ -106,7 +135,8 @@ class Orchestrator:
             return
         _log("=== Фаза PLANNER (qwen2.5-coder) ===")
         map_ = context.project_map()
-        plan_md, tasks = roles.planner_create(self.request, map_)
+        plan_md, tasks = _wait_with_heartbeat(
+            lambda: roles.planner_create(self.request, map_), "plan")
         tasks = [_normalize_task(t) for t in tasks]
         state.save_plan(plan_md)
         state.save_tasks(tasks)
@@ -140,8 +170,10 @@ class Orchestrator:
                 dep = dependency_code_for(task, map_)
                 progress = state.load_progress_tail()
                 try:
-                    files, notes = roles.coder_generate(task, self.plan_md, map_, dep,
-                                                        progress, diagnosis)
+                    files, notes = _wait_with_heartbeat(
+                        lambda t=task, m_=map_, d=dep, pr=progress, dg=diagnosis:
+                            roles.coder_generate(t, self.plan_md, m_, d, pr, dg),
+                        "debug" if diagnosis else "code")
                 except llm.LLMError as e:
                     _log(f"Задача #{task['id']}: ошибка кодера ({str(e)[:150]}) — повтор")
                     task["debug_rounds"] += 1
@@ -163,7 +195,11 @@ class Orchestrator:
                     if ".." in path or os.path.isabs(path):
                         _log(f"подозрительный путь '{path}' — игнор")
                         continue
-                    context.write_file(path, content)
+                    try:
+                        context.write_file(path, content)
+                    except (PermissionError, ValueError) as e:
+                        _log(f"файл '{path}' отклонён: {e}")
+                        continue
                     written.append(path)
                 if not written:
                     diagnosis = "Кодер не записал ни одного файла. Верни файлы с корректными путями."
@@ -185,7 +221,8 @@ class Orchestrator:
                     f"--- {p} ---\n{context.read_file(p)[:1500]}" for p in written
                 )
                 try:
-                    passed, diag = roles.tester_judge(task, written, hard_out, snippets)
+                    passed, diag = _wait_with_heartbeat(
+                        lambda: roles.tester_judge(task, written, hard_out, snippets), "test")
                 except llm.LLMError as e:
                     # не роняем процесс: при ошибке формата доверяемся реальным проверкам
                     _log(f"Задача #{task['id']}: ошибка тестера ({str(e)[:150]}) — решающий exit code")
@@ -221,15 +258,19 @@ class Orchestrator:
             return
         _log("=== Ре-план: новые мелкие задачи по пробелам ===")
         try:
-            new = roles.planner_replan(self.plan_md, tasks_status_str(self.tasks),
-                                       state.load_progress_tail(), context.project_map())
+            new = _wait_with_heartbeat(
+                lambda: roles.planner_replan(self.plan_md, tasks_status_str(self.tasks),
+                                             state.load_progress_tail(), context.project_map()),
+                "replan")
         except llm.LLMError as e:
             _log(f"Ре-план не удался ({str(e)[:150]}) — пропускаю, идем к сверке.")
             new = []
         existing_ids = {t["id"] for t in self.tasks}
         added = [_normalize_task(t) for t in new if t["id"] not in existing_ids]
         for t in failed:
-            t["status"] = "pending"; t["debug_rounds"] = 0  # второй шанс после реплана
+            # второй шанс после реплана; бара не касаемся — _failed остаётся как статистика сессии,
+            # а "обработано" для новых pending-задач пересчитает set_plan()
+            t["status"] = "pending"; t["debug_rounds"] = 0
         if added:
             self.tasks.extend(added)
             _log(f"Добавлено задач: {len(added)}")
@@ -242,8 +283,10 @@ class Orchestrator:
         self.bar.set_phase("audit")
         _log("=== Финальная сверка результата с планом (Auditor=qwen3:8b) ===")
         try:
-            result = roles.auditor_check(self.plan_md, tasks_status_str(self.tasks),
-                                         context.project_map(), state.load_progress_tail(20))
+            result = _wait_with_heartbeat(
+                lambda: roles.auditor_check(self.plan_md, tasks_status_str(self.tasks),
+                                            context.project_map(), state.load_progress_tail(20)),
+                "audit")
         except llm.LLMError as e:
             _log(f"Auditor не смог вернуть JSON ({str(e)[:150]}) — механическая сверка по статусам.")
             done = [t for t in self.tasks if t["status"] == "done"]
@@ -309,26 +352,38 @@ def _early_log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def main():
-    if len(sys.argv) < 2 or sys.argv[1].startswith("-"):
-        print(__doc__ or "")
-        print('usage: python -m coding_agent "описание проекта" [--name my-app] [--fresh]')
-        sys.exit(1)
-    request = sys.argv[1]
-    fresh = "--fresh" in sys.argv
+def main(argv: list[str] | None = None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="python -m coding_agent",
+        description='Кодер-агент: план -> код -> тесты -> сверка (ротация моделей через Ollama).',
+    )
+    parser.add_argument("request", help='описание проекта, например "Напиши чат-приложение..."')
+    parser.add_argument("--name", metavar="SLUG", default=None,
+                        help="имя папки проекта в workflow/ (по умолчанию — из запроса)")
+    parser.add_argument("--fresh", action="store_true",
+                        help="не подхватывать существующий проект; начать с чистой страницы")
+    parser.add_argument("--resume", metavar="NAME", nargs="?", const="", default=None,
+                        help="продолжить проект по имени папки в workflow/ (без имени — поиск по запросу)")
+    args = parser.parse_args(argv)
 
-    # имя проекта: --name <slug> или автоматический slug из запроса
-    name = None
-    if "--name" in sys.argv:
-        i = sys.argv.index("--name")
-        if i + 1 < len(sys.argv):
-            name = config.slugify(sys.argv[i + 1])
+    request = args.request
+    fresh = args.fresh
+    name = config.slugify(args.name) if args.name else None
 
     if not fresh:
         existing = config.find_existing_project(request)
         if existing:
             config.init_paths(existing)
             _early_log(f"Продолжаю существующий проект: {existing}/")
+        elif args.resume is not None and args.resume.strip():
+            # явное resume по имени папки
+            cand = os.path.join(config.WORKFLOW_ROOT, config.slugify(args.resume))
+            if os.path.isdir(cand):
+                config.init_paths(cand)
+                _early_log(f"Продолжаю проект по имени (--resume): {config.PROJECT_DIR}/")
+            else:
+                _early_log(f"--resume: папка {cand}/ не найдена — создаю новый проект")
         elif name and os.path.isdir(os.path.join(config.WORKFLOW_ROOT, name)):
             config.init_paths(os.path.join(config.WORKFLOW_ROOT, name))
             _early_log(f"Продолжаю проект по имени: {config.PROJECT_DIR}/")
@@ -340,7 +395,8 @@ def main():
         _early_log(f"Новый проект: {project_dir}/")
 
     if fresh:
-        for f in (config.PLAN_FILE, config.TASKS_FILE, config.PROGRESS_FILE, config.AUDIT_FILE):
+        for f in (config.PLAN_FILE, config.TASKS_FILE, config.PROGRESS_FILE,
+                  config.AUDIT_FILE, config.BAR_FILE):
             if os.path.exists(f):
                 os.remove(f)
         print("Состояние очищено (--fresh).")

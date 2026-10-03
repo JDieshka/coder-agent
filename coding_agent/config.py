@@ -36,6 +36,11 @@ KEEP_ALIVE = "0"              # немедленная выгрузка моде
 MAX_DEBUG_ROUNDS = 3          # циклов coder->tester на одну задачу
 TEST_TIMEOUT = 120            # секунд на запуск проверок
 REQ_TIMEOUT = 600             # секунд на HTTP-запрос к ollama
+PIP_TIMEOUT = 300             # секунд на pip install зависимостей проекта
+
+# автоустановка зависимостей из requirements.txt проекта (pip install отсутствующих пакетов).
+# Выключается переменной окружения CODER_AGENT_NO_INSTALL=1.
+AUTO_INSTALL_REQS = os.environ.get("CODER_AGENT_NO_INSTALL", "0") != "1"
 
 # Все проекты агента живут в одной папке workflow/<имя_проекта>/:
 # там и код проекта, и его состояние (agent_state/).

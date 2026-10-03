@@ -7,10 +7,60 @@ from . import config
 IGNORE_DIRS = {".git", "agent_state", "__pycache__", "node_modules", ".venv", "venv",
                ".pytest_cache", "dist", "build"}
 
+# точный токенизатор (опционально): если tiktoken не установлен — остаётся грубая эвристика
+try:
+    import tiktoken
+    _ENC = tiktoken.get_encoding("cl100k_base")   # близко к чату Qwen; консервативная оценка
+except Exception:
+    _ENC = None
+
+
+def token_cost(s: str) -> int:
+    """Стоимость строки в токенах: tiktoken (точно) или ~3.8 символа/токен (эвристика)."""
+    if not s:
+        return 0
+    if _ENC is not None:
+        try:
+            return len(_ENC.encode(s, disallowed_special=())) + 4  # запас на role/разделители
+        except Exception:
+            pass
+    return int(len(s) / 3.8) + 1
+
+# файлы, которые модели-кодеру запрещено трогать (состояние агента и служебное)
+PROTECTED_FILES = {"requirements.txt", ".gitignore"}
+
+
+def is_protected(path: str) -> bool:
+    """True, если файл относится к состоянию агента/службе — писать его нельзя."""
+    norm = path.replace("\\", "/").lstrip("./")
+    parts = norm.split("/")
+    if "agent_state" in parts or ".git" in parts:
+        return True
+    base = parts[-1]
+    if base in PROTECTED_FILES or base.endswith((".log", ".lock")):
+        return True
+    if base == "request.txt":
+        return True
+    return False
+
 
 def approx_tokens(s: str) -> int:
-    # грубая оценка: ~3.8 символа на токен для смешанных RU/EN+кода
-    return int(len(s) / 3.8) + 1
+    """Совместимость: делегирует в token_cost (tiktoken, если доступен)."""
+    return token_cost(s)
+
+
+def _cut_to_tokens(text: str, max_tokens: int) -> str:
+    """Обрезает строку не длиннее max_tokens токенов (бинарный поиск по символам)."""
+    if token_cost(text) <= max_tokens:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if token_cost(text[:mid]) <= max_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + "\n...[усечено из-за лимита контекста]"
 
 
 def project_path(path: str) -> str:
@@ -65,7 +115,13 @@ def read_file(path: str) -> str:
 
 
 def write_file(path: str, content: str):
+    if is_protected(path):
+        raise PermissionError(f"защита состояния: файл '{path}' не может быть перезаписан моделью")
     full = project_path(path)
+    # двойная страховка: итоговый путь обязан оставаться внутри каталога проекта
+    root_abs = os.path.abspath(config.PROJECT_DIR or ".")
+    if not os.path.abspath(full).startswith(root_abs + os.sep) and os.path.abspath(full) != root_abs:
+        raise ValueError(f"путь вне каталога проекта: {path}")
     os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
     with open(full, "w", encoding="utf-8") as f:
         f.write(content)
@@ -73,21 +129,29 @@ def write_file(path: str, content: str):
 
 def build_messages(system: str, blocks: list[tuple[str, str]],
                    budget: int = config.MAX_PROMPT_TOKENS) -> list[dict]:
-    """Собирает prompt из приоритетных блоков; при переполнении отбрасывает хвостовые блоки."""
-    header_chars = sum(approx_tokens(t) for _, t in [("sys", system)])
-    used = header_chars
+    """Собирает prompt из приоритетных блоков; при переполнении отбрасывает хвостовые блоки.
+
+    Счёт токенов ведётся по ИТОГОВОЙ user-строке (с заголовками '### title'),
+    поэтому бюджет соблюдается даже когда tiktoken недоступен и работает эвристика.
+    """
     kept = []
+
+    def joined() -> str:
+        return "\n\n".join(f"### {t}\n{c}" for t, c in kept)
+
+    used = token_cost(system)
     for title, text in blocks:
-        cost = approx_tokens(text) + approx_tokens(title) + 4
-        if used + cost > budget:
+        trial = kept + [(title, text)]
+        cost_total = token_cost(joined_for(trial))
+        if used + cost_total > budget:
             # урезаем конкретный блок до остатка бюджета, если он важен
-            remaining = budget - used
+            remaining = budget - used - token_cost(f"### {title}\n\n") - 40
             if remaining > 300:
-                cut = int(remaining * 3.8)
-                text = text[:cut] + "\n...[усечено из-за лимита контекста]"
-                kept.append((title, text))
+                kept.append((title, _cut_to_tokens(text, remaining)))
             break
         kept.append((title, text))
-        used += cost
-    user = "\n\n".join(f"### {t}\n{c}" for t, c in kept)
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    return [{"role": "system", "content": system}, {"role": "user", "content": joined()}]
+
+
+def joined_for(blocks: list[tuple[str, str]]) -> str:
+    return "\n\n".join(f"### {t}\n{c}" for t, c in blocks)

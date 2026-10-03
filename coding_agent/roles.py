@@ -1,7 +1,8 @@
 """Промпты ролей и парсинг ответов моделей в структурированные данные."""
-from . import llm
+from . import config, context, llm
 
 PLANNER_SYSTEM = (
+    llm.JSON_FORMAT_MARKER + "\n"
     "Ты — планировщик разработки (Planner). Получаешь описание проекта. "
     "Составь план на русском: стек (минимальные зависимости), структура файлов, "
     "и декомпозицию на 5-12 МАЛЕНЬКИХ последовательных задач. Каждая задача должна "
@@ -15,6 +16,7 @@ PLANNER_SYSTEM = (
 )
 
 REPLAN_SYSTEM = (
+    llm.JSON_FORMAT_MARKER + "\n"
     "Ты — планировщик. По текущему плану, списку задач и прогрессу скорректируй очередь: "
     "предложи НОВЫЕ задачи (не переиспользуй id существующих), если чего-то не хватает. "
     'Верни строго JSON: {"new_tasks":[{"id":<новый int>,"title":"...","goal":"...",'
@@ -22,6 +24,7 @@ REPLAN_SYSTEM = (
 )
 
 CODER_SYSTEM = (
+    llm.JSON_FORMAT_MARKER + "\n"
     "Ты — разработчик (Coder). Пишешь код одной задачей за раз под RTX4060/контекст 16K. "
     "Пиши полный содержимый код без заглушек TODO; интерфейс согласуй с картой проекта. "
     "Для каждого файла верни полное содержимое (overwrite).\n"
@@ -41,17 +44,33 @@ DEBUG_CODER_SYSTEM = CODER_SYSTEM + (
 )
 
 TESTER_SYSTEM = (
+    llm.JSON_FORMAT_MARKER + "\n"
     "Ты — тестировщик-дебаггер (Tester). Тебе дают задачу, принятые файлы кода и РЕАЛЬНЫЙ "
     "вывод запуска проверок. Оцени: пройдено ли acceptance. Верни СТРОГО JSON:\n"
     '{"passed": true|false, "diagnosis": "если passed=false: конкретные причины и что исправить по файлам, иначе кратко почему принято"}'
 )
 
 AUDITOR_SYSTEM = (
+    llm.JSON_FORMAT_MARKER + "\n"
     "Ты — аудитор финальной сверки. Сравни ПЛАН и ФАКТЧЕСКОЕ состояние проекта (карта "
     "файлов, статусы задач, последние проверки). Верни СТРОГО JSON:\n"
     '{"summary":"итог на русском", "covered":["пункт плана: реализован (где)"], '
     '"gaps":["пункт плана: НЕ реализовано/частично (что doделать)"]}'
 )
+
+
+def _dump_raw(role: str, content: str):
+    """Полный ответ модели — в agent_state/raw_responses/{role}_{ts}.json (для отладки формата)."""
+    try:
+        import json as _json, os, time as _time
+        d = os.path.join(config.STATE_DIR, "raw_responses")
+        os.makedirs(d, exist_ok=True)
+        fn = os.path.join(d, f"{role}_{int(_time.time()*1000)}.json")
+        with open(fn, "w", encoding="utf-8") as f:
+            _json.dump({"role": role, "chars": len(content), "text": content},
+                       f, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 def chat_json(role: str, messages: list[dict], parse, retries: int = 2):
@@ -60,6 +79,7 @@ def chat_json(role: str, messages: list[dict], parse, retries: int = 2):
     last_err = None
     for attempt in range(retries + 1):
         content = llm.chat(role, msgs)
+        _dump_raw(role, content)
         try:
             return parse(content)
         except Exception as e:
@@ -116,23 +136,21 @@ def _coerce_dict(data, key: str) -> dict:
 def coder_generate(task: dict, plan_md: str, map_: str, dep_code: str,
                    progress: str, diagnosis: str | None) -> tuple[list[dict], str]:
     system = DEBUG_CODER_SYSTEM if diagnosis else CODER_SYSTEM
-    blocks = [
+    blocks0 = [
         ("ЦЕЛЬ (план)", plan_md[:3000]),
         ("ЗАДАЧА", f"id={task['id']}: {task['title']}\n{task['goal']}\n"
                    f"Файлы: {', '.join(task['files'])}\nAcceptance: {task['acceptance']}"),
         ("КАРТА ПРОЕКТА", map_),
     ]
+    blocks = list(blocks0)
     if dep_code:
         blocks.append(("СУЩЕСТВУЮЩИЙ СВЯЗАННЫЙ КОД", dep_code))
     if progress:
         blocks.append(("ПРОГРЕСС", progress))
     if diagnosis:
         blocks.append(("ДИАГНОСТИКА ТЕСТЕРШИКА (исправь!)", diagnosis))
-    user = "\n\n".join(f"### {t}\n{c}" for t, c in blocks)
-    data = chat_json("coder", [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ], lambda c: _coerce_dict(llm.extract_json(c), "files"))
+    msgs = context.build_messages(system, blocks)
+    data = chat_json("coder", msgs, lambda c: _coerce_dict(llm.extract_json(c), "files"))
     files = data.get("files", [])
     # нормализация: модель могла вернуть {"path": ..., "content": ...} без обёртки "files"
     if not files and task["files"] and "path" in data and "content" in data:
@@ -150,14 +168,14 @@ def coder_generate(task: dict, plan_md: str, map_: str, dep_code: str,
 
 def tester_judge(task: dict, written_files: list[str], test_output: str,
                  code_snippets: str) -> tuple[bool, str]:
-    user = (f"ЗАДАЧА: {task['title']}\nAcceptance: {task['acceptance']}\n\n"
-            f"НАПИСАНЫ ФАЙЛЫ:\n" + "\n".join(written_files) + "\n\n"
-            f"КОД (фрагменты):\n{code_snippets}\n\n"
-            f"РЕАЛЬНЫЙ ВЫВОД ПРОВЕРОК (exit code + stdout/stderr):\n{test_output}")
-    data = chat_json("tester", [
-        {"role": "system", "content": TESTER_SYSTEM},
-        {"role": "user", "content": user},
-    ], lambda c: _coerce_dict(llm.extract_json(c), "verdict"))
+    blocks = [
+        ("ЗАДАЧА", f"{task['title']}\nAcceptance: {task['acceptance']}"),
+        ("НАПИСАНЫ ФАЙЛЫ", "\n".join(written_files)),
+        ("КОД (фрагменты)", code_snippets),
+        ("РЕАЛЬНЫЙ ВЫВОД ПРОВЕРОК (exit code + stdout/stderr)", test_output),
+    ]
+    data = chat_json("tester", context.build_messages(TESTER_SYSTEM, blocks),
+                     lambda c: _coerce_dict(llm.extract_json(c), "verdict"))
     # модель могла вернуть голый true/false или {"passed": ...}
     if isinstance(data, bool):
         return data, ""
@@ -167,12 +185,10 @@ def tester_judge(task: dict, written_files: list[str], test_output: str,
 
 
 def auditor_check(plan_md: str, tasks_status: str, map_: str, last_tests: str) -> dict:
-    user = (f"ПЛАН:\n{plan_md}\n\nСТАТУСЫ ЗАДАЧ:\n{tasks_status}\n\n"
-            f"ФАЙЛЫ:\n{map_}\n\nПОСЛЕДНИЕ ПРОВЕРКИ:\n{last_tests}")
-    return chat_json("auditor", [
-        {"role": "system", "content": AUDITOR_SYSTEM},
-        {"role": "user", "content": user},
-    ], llm.extract_json)
+    blocks = [("ПЛАН", plan_md), ("СТАТУСЫ ЗАДАЧ", tasks_status),
+              ("ФАЙЛЫ", map_), ("ПОСЛЕДНИЕ ПРОВЕРКИ", last_tests)]
+    return chat_json("auditor", context.build_messages(AUDITOR_SYSTEM, blocks),
+                     llm.extract_json)
 
 
 def _normalize_tasks(tasks: list[dict]) -> list[dict]:

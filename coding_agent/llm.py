@@ -7,6 +7,10 @@ import requests
 
 from . import config
 
+# явный маркер JSON-режима: добавляется к system-промптам ролей, ожидающих JSON.
+# chat() включает format=json по наличию маркера (плюс обратная совместимость со старыми промптами).
+JSON_FORMAT_MARKER = "[FORMAT:JSON]"
+
 
 class LLMError(RuntimeError):
     pass
@@ -45,53 +49,80 @@ def check_models():
         )
 
 
+def unload_model(model: str):
+    """Явная выгрузка модели из VRAM (keep_alive=0 с пустым запросом) — перед fallback."""
+    try:
+        requests.post(f"{config.OLLAMA_URL}/api/generate",
+                      json={"model": model, "prompt": "", "keep_alive": "0"}, timeout=15)
+    except Exception:
+        pass
+
+
 def chat(role: str, messages: list[dict]) -> str:
     """Один «автоматическая сессия»: загрузить модель -> запрос -> выгрузить."""
     rc = config.ROLES[role]
     models_to_try = [rc.model] + ([rc.fallback_model] if rc.fallback_model else [])
     last_err = None
-    for model in models_to_try:
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": False,
-            "keep_alive": config.KEEP_ALIVE,   # немедленная выгрузка -> следующая роль без OOM
-            "options": {
-                "temperature": rc.temperature,
-                "num_ctx": config.CTX_WINDOW,
-                "num_predict": rc.max_tokens,
-            },
-        }
-        if rc.think is False and model.startswith("qwen3"):
-            payload["think"] = False  # qwen3: отключаем reasoning-токены для экономии контекста
-        fmt = ""
-        for m in messages:
-            if m["role"] == "system":
-                fmt = m["content"]
-        wants_json = '"files"' in fmt or '"tasks"' in fmt or '"passed"' in fmt \
-                     or '"new_tasks"' in fmt or '"gaps"' in fmt
-        if wants_json:
-            # JSON-режим Ollama (grammar-constrained decoding): ответ всегда валидный JSON,
-            # переводы строк внутри content экранируются моделью принудительно
-            payload["format"] = "json"
-        _log(f"role={role} model={model} msg_chars={sum(len(m['content']) for m in messages)}")
-        t0 = time.time()
-        try:
-            r = requests.post(f"{config.OLLAMA_URL}/api/chat", json=payload,
-                              timeout=config.REQ_TIMEOUT)
-            r.raise_for_status()
-            data = r.json()
-            content = data.get("message", {}).get("content", "")
-            if not content.strip():
-                raise LLMError("пустой ответ модели")
-            _log(f"role={role} done in {time.time()-t0:.1f}s, resp_chars={len(content)}")
-            return content
-        except Exception as e:
-            last_err = e
-            _log(f"role={role} model={model} FAILED: {e}")
-            # fallback на другую модель только при ошибке загрузки/OOM
-            continue
+    for attempt in range(2):  # сетевые сбои Ollama ретраим один раз
+        for i, model in enumerate(models_to_try):
+            payload = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "keep_alive": config.KEEP_ALIVE,   # немедленная выгрузка -> следующая роль без OOM
+                "options": {
+                    "temperature": rc.temperature,
+                    "num_ctx": config.CTX_WINDOW,
+                    "num_predict": rc.max_tokens,
+                },
+            }
+            if rc.think is False and model.startswith("qwen3"):
+                payload["think"] = False  # qwen3: отключаем reasoning-токены для экономии контекста
+            wants_json = _wants_json(messages)
+            if wants_json:
+                # JSON-режим Ollama (grammar-constrained decoding): ответ всегда валидный JSON,
+                # переводы строк внутри content экранируются моделью принудительно
+                payload["format"] = "json"
+            _log(f"role={role} model={model} msg_chars={sum(len(m['content']) for m in messages)}")
+            t0 = time.time()
+            try:
+                r = requests.post(f"{config.OLLAMA_URL}/api/chat", json=payload,
+                                  timeout=config.REQ_TIMEOUT)
+                r.raise_for_status()
+                data = r.json()
+                content = data.get("message", {}).get("content", "")
+                if not content.strip():
+                    raise LLMError("пустой ответ модели")
+                _log(f"role={role} done in {time.time()-t0:.1f}s, resp_chars={len(content)}")
+                return content
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last_err = e
+                _log(f"role={role} model={model} NETWORK FAILED (attempt {attempt+1}): {e}")
+                if attempt == 0:
+                    break  # повтор внешнего цикла; на втором попытка не дублируется
+                continue
+            except Exception as e:
+                last_err = e
+                _log(f"role={role} model={model} FAILED: {e}")
+                # перед переходом на fallback-модель освобождаем VRAM явной выгрузкой
+                if i + 1 < len(models_to_try):
+                    unload_model(model)
+                continue
+        else:
+            break  # внутренний цикл отработал без early-break по сети — выходим
     raise LLMError(f"Все модели роли '{role}' исчерпаны. Последняя ошибка: {last_err}")
+
+
+def _wants_json(messages: list[dict]) -> bool:
+    """JSON-режим включается явным маркером в system-промпте (плюс старые промпты — СК)."""
+    fmt = ""
+    for m in messages:
+        if m["role"] == "system":
+            fmt = m["content"]
+    if JSON_FORMAT_MARKER in fmt:
+        return True
+    return ('"files"' in fmt or '"tasks"' in fmt or '"passed"' in fmt
+            or '"new_tasks"' in fmt or '"gaps"' in fmt)
 
 
 def _balanced_slice(text: str, start: int, opener: str, closer: str) -> str | None:

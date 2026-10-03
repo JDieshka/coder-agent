@@ -58,8 +58,11 @@ class ProgressBar:
 
     # ---------- публичные события ----------
     def set_plan(self, tasks: list[dict]):
+        """Синхронизирует счётчики с актуальным tasks.json (идемпотентно для resume/replan)."""
         self.total_tasks = len(tasks)
         self.done_tasks = sum(1 for t in tasks if t.get("status") == "done")
+        # failed тоже пересчитываем из задач — иначе при повторных вызовах счётчик накапливался
+        self._failed = sum(1 for t in tasks if t.get("status") == "failed")
         self._render(force=True)
 
     def start_task(self, task: dict):
@@ -83,6 +86,12 @@ class ProgressBar:
     def debug_round(self, rounds: int):
         self.rounds = rounds
         self.phase = "debug"
+        self._render(force=True)
+
+    def tick(self, label: str | None = None):
+        """Фоновое обновление строки (таймер/ETA) во время долгого ожидания модели."""
+        if label is not None and label != self.phase:
+            self.phase = label
         self._render(force=True)
 
     def set_phase(self, phase: str):
