@@ -99,7 +99,21 @@ def chat(role: str, messages: list[dict]) -> str:
                 last_err = e
                 _log(f"role={role} model={model} NETWORK FAILED (attempt {attempt+1}): {e}")
                 if attempt == 0:
+                    time.sleep(2.0)   # дать Ollama опомниться после обрыва
                     break  # повтор внешнего цикла; на втором попытка не дублируется
+                continue
+            except requests.HTTPError as e:
+                # 5xx у Ollama — временные сбои (OOM при загрузке модели, рестарт сервиса); ретраим
+                status = getattr(getattr(e, "response", None), "status_code", 0) or 0
+                last_err = e
+                transient = 500 <= status < 600
+                _log(f"role={role} model={model} HTTP {status or '?'} FAILED"
+                     f"{' (transient)' if transient else ''}: {e}")
+                if transient and attempt == 0:
+                    time.sleep(3.0)
+                    break  # повтор внешнего цикла с той же моделью, без перехода на fallback
+                if i + 1 < len(models_to_try):
+                    unload_model(model)
                 continue
             except Exception as e:
                 last_err = e

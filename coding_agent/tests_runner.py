@@ -74,6 +74,19 @@ _DANGEROUS_ATTRS = {
     ("subprocess", "Popen"), ("subprocess", "call"), ("subprocess", "check_output"),
     ("socket", "socket"), ("ctypes", "CDLL"), ("pathlib", "Path"),
 }
+# сетевые bind/serve: чат-приложения на FastAPI/Flask часто зовут сервер прямо в smoke-проверке —
+# это блокирует процесс до TEST_TIMEOUT и занимает порт. Разрешаем только создание приложения,
+# запуск сервера остаётся на совести пользователя (инструкция в README).
+_SERVER_ATTRS = {"bind", "serve", "serve_forever", "listen", "run_app", "run_simple"}
+_DANGEROUS_ATTRS.update({("uvicorn", "run"), ("flask", "run")})
+
+
+def _is_main_guard(node: ast.AST) -> bool:
+    """True для узла if __name__ == '__main__' (и вариантов '=='/`== '__main__'`)."""
+    return (isinstance(node, ast.Compare)
+            and isinstance(node.left, ast.Name) and node.left.id == "__name__"
+            and any(isinstance(c, ast.Constant) and c.value == "__main__"
+                    for c in node.comparators))
 
 
 def scan_dangerous(src: str) -> list[str]:
@@ -83,7 +96,15 @@ def scan_dangerous(src: str) -> list[str]:
         tree = ast.parse(src)
     except SyntaxError:
         return problems  # синтаксис ловит py_compile, здесь не наша забота
+    # узлы внутри if __name__ == "__main__": при smoke-импорте (run_name='__notmain__')
+    # не исполняются — сервер из main-guard не блокирует проверку и не занимает порт
+    guarded_ids = set()
     for node in ast.walk(tree):
+        if isinstance(node, ast.If) and _is_main_guard(node.test):
+            guarded_ids.update(id(ch) for ch in ast.walk(node))
+    for node in ast.walk(tree):
+        if id(node) in guarded_ids and not (isinstance(node, ast.Compare) and _is_main_guard(node)):
+            continue   # опасный вызов под защитой main — не считаем
         if isinstance(node, ast.Call):
             fn = node.func
             if isinstance(fn, ast.Name) and fn.id in _DANGEROUS_CALLS:
@@ -93,7 +114,7 @@ def scan_dangerous(src: str) -> list[str]:
                 pair = (base, fn.attr)
                 if pair in _DANGEROUS_ATTRS:
                     problems.append(f"строка {node.lineno}: вызов {base}.{fn.attr}()")
-                elif fn.attr in {"system", "popen", "rmtree", "Popen"}:
+                elif fn.attr in {"system", "popen", "rmtree", "Popen"} or fn.attr in _SERVER_ATTRS:
                     problems.append(f"строка {node.lineno}: вызов ?.{fn.attr}()")
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             mods = ([a.name for a in node.names] if isinstance(node, ast.Import)
