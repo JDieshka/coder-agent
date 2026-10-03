@@ -129,29 +129,36 @@ def write_file(path: str, content: str):
 
 def build_messages(system: str, blocks: list[tuple[str, str]],
                    budget: int = config.MAX_PROMPT_TOKENS) -> list[dict]:
-    """Собирает prompt из приоритетных блоков; при переполнении отбрасывает хвостовые блоки.
+    """Собирает prompt из приоритетных блоков; при переполнении урезает/отбрасывает хвостовые.
 
-    Счёт токенов ведётся по ИТОГОВОЙ user-строке (с заголовками '### title'),
-    поэтому бюджет соблюдается даже когда tiktoken недоступен и работает эвристика.
+    Счёт ведётся по ИТОГОВОЙ user-строке (с заголовками '### title'), бюджет — это
+    system+user вместе. Если один системный промпт больше бюджета — он усeкается до
+    80% бюджета, чтобы в промпт обязательно попали задача и карта проекта.
     """
-    kept = []
+    sys_cost = token_cost(system)
+    if sys_cost > budget:
+        system = _cut_to_tokens(system, int(budget * 0.8))
+        sys_cost = token_cost(system)
 
-    def joined() -> str:
-        return "\n\n".join(f"### {t}\n{c}" for t, c in kept)
+    kept: list[tuple[str, str]] = []
 
-    used = token_cost(system)
+    def joined(bs) -> str:
+        return "\n\n".join(f"### {t}\n{c}" for t, c in bs)
+
     for title, text in blocks:
         trial = kept + [(title, text)]
-        cost_total = token_cost(joined_for(trial))
-        if used + cost_total > budget:
-            # урезаем конкретный блок до остатка бюджета, если он важен
-            remaining = budget - used - token_cost(f"### {title}\n\n") - 40
-            if remaining > 300:
-                kept.append((title, _cut_to_tokens(text, remaining)))
-            break
-        kept.append((title, text))
-    return [{"role": "system", "content": system}, {"role": "user", "content": joined()}]
-
-
-def joined_for(blocks: list[tuple[str, str]]) -> str:
-    return "\n\n".join(f"### {t}\n{c}" for t, c in blocks)
+        if sys_cost + token_cost(joined(trial)) <= budget:
+            kept.append((title, text))
+            continue
+        # не влезает целиком: пробуем урезать этот блок до остатка бюджета.
+        # считаем итог именно по собранной строке (token_cost конкатенации != сумме частей),
+        # иначе при системном промпте ~budget первый блок никогда не проходил бы проверку
+        remaining = max(0, budget - sys_cost - 60)
+        cut = _cut_to_tokens(text, remaining)
+        trial_cut = kept + [(title, cut)]
+        if token_cost(f"### {title}\n") > remaining or \
+                sys_cost + token_cost(joined(trial_cut)) > budget:
+            trial_cut = kept          # усечённый блок тоже не влезает — отбрасываем его
+        kept = trial_cut
+        break
+    return [{"role": "system", "content": system}, {"role": "user", "content": joined(kept)}]
