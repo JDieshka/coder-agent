@@ -16,6 +16,11 @@ def _log(msg: str):
     if _bar is not None and _bar._enabled:
         _bar.clear()
     print(line, flush=True)
+    # каталог agent_state может ещё не существовать (первый лог сразу после init_paths)
+    try:
+        os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
+    except OSError:
+        pass
     with open(config.LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 

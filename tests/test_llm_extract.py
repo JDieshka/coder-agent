@@ -1,6 +1,7 @@
 """Юнит-тесты парсера JSON из ответов моделей (грязные/битые форматы)."""
 import pytest
 
+from coding_agent import llm
 from coding_agent.llm import LLMError, extract_json
 
 
@@ -54,3 +55,29 @@ def test_text_before_and_after_json():
 def test_invalid_raises_llmerror():
     with pytest.raises(LLMError):
         extract_json("совсем не json {{{")
+
+
+def test_salvage_truncated_plan_tasks():
+    """Обрезанный плановый JSON: полные задачи из оборванного массива tasks."""
+    t = ('{"plan_md": "# План\\ntext", "tasks": '
+         '[{"id":1,"title":"Каркас","goal":"g","files":["a.py"],"acceptance":"ok"},'
+         '{"id":2,"title":"Auth","goal":"g2","files":["b.py"],"acc')
+    r = llm.extract_json(t)
+    assert isinstance(r, dict) and len(r["tasks"]) == 1
+    assert r["tasks"][0]["title"] == "Каркас"
+
+
+def test_truncated_plan_without_tasks_raises():
+    """План оборван до начала tasks — предсказуемая ошибка (ретрай с коротким хинтом)."""
+    t = '{"plan_md": "# План\\n## Стек\\n- Python\\nproject/\\n├── app/\\n│   ├── models.py'
+    with pytest.raises(llm.LLMError):
+        llm.extract_json(t)
+
+
+def test_parse_plan_restores_plan_md_from_tasks():
+    from coding_agent import roles
+    t = ('{"plan_md": "# П\\nt", "tasks": [{"id":1,"title":"T1","goal":"g",'
+         '"files":["x"],"acceptance":"a"},{"id":2,"title":"T2","goal":"g","files"')
+    d = roles._parse_plan(t)
+    assert d["plan_md"].startswith("# План") or "восстановлен" in d["plan_md"]
+    assert len(d["tasks"]) == 1

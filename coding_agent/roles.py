@@ -9,6 +9,8 @@ PLANNER_SYSTEM = (
     "быть выполнима за один проход кодирования с контекстом <=16K токенов: "
     "один-два файла максимум. Порядок: каркас -> аутентификация -> модель данных -> "
     "личные чаты -> групповые чаты -> тесты.\n"
+    "ЭКОНОМЬ ТОКЕНЫ: plan_md — кратко (до ~20 строк), БЕЗ ASCII-диаграмм дерева "
+    "файлов и без ```-блоков; основной объём ответа — массив tasks.\n"
     "Верни СТРОГО JSON без пояснений:\n"
     '{"plan_md": "полный текст плана в markdown", '
     '"tasks": [{"id": 1, "title": "...", "goal": "что сделать", '
@@ -74,7 +76,11 @@ def _dump_raw(role: str, content: str):
 
 
 def chat_json(role: str, messages: list[dict], parse, retries: int = 2):
-    """Вызывает модель и парсит JSON; при ошибке парсинга просит модель исправить формат."""
+    """Вызывает модель и парсит JSON; при ошибке парсинга просит модель исправить формат.
+
+    Если ответ выглядит ОБРЕЗАННЫМ (генерация упёрлась в num_predict), ретрай не
+    «повтори тот же длинный ответ», а явная просьба уложиться в короткий JSON —
+    иначе модель детерминированно воспроизводит тот же обрыв (как было с planner)."""
     msgs = list(messages)
     last_err = None
     for attempt in range(retries + 1):
@@ -85,11 +91,19 @@ def chat_json(role: str, messages: list[dict], parse, retries: int = 2):
         except Exception as e:
             last_err = e
             llm._log(f"role={role} PARSE FAILED (attempt {attempt + 1}): {str(e)[:200]}")
+            short_hint = ""
+            if role in ("planner", "replanner"):
+                short_hint = (
+                    "\nВАЖНО: предыдущий ответ был ОБРЕЗАН из-за лимита токенов. "
+                    "Ответь ЗНАЧИТЕЛЬНО КОРОЧЕ: plan_md — не более 15 строк markdown, "
+                    "без ASCII-диаграмм дерева файлов и без ```-блоков; основной объём — массив tasks."
+                )
             msgs = list(messages) + [
                 {"role": "assistant", "content": content[:4000]},
                 {"role": "user", "content":
                     f"Твой ответ не является корректным JSON. Ошибка: {str(last_err)[:300]}\n"
-                    "Повтори ответ СТРОГО в запрошенном JSON-формате, без пояснений."},
+                    "Повтори ответ СТРОГО в запрошенном JSON-формате, без пояснений."
+                    + short_hint},
             ]
     raise llm.LLMError(f"Роль '{role}': {retries + 1} попыток, JSON не распознан. Последняя ошибка: {last_err}")
 
@@ -110,6 +124,11 @@ def planner_create(request: str, map_: str) -> tuple[str, list[dict]]:
 
 def _parse_plan(content: str) -> dict:
     data = _coerce_dict(llm.extract_json(content), "tasks")
+    # если спасённый из обрыва объект содержит только tasks — восстановим план из задач,
+    # иначе planner_create отклонит валидный неполный ответ ("План пуст")
+    if not data.get("plan_md") and data.get("tasks"):
+        data["plan_md"] = "# План (восстановлен из задач)\n" + "\n".join(
+            f"- #{t.get('id')}: {t.get('title', '')}" for t in data["tasks"])
     if not data.get("tasks"):
         raise llm.LLMError("в JSON нет массива 'tasks'")
     return data

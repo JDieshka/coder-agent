@@ -20,12 +20,20 @@ class RoleConfig:
     max_tokens: int = 2048
     think: bool = False   # включённый reasoning у qwen3
 
+# num_predict (макс. токенов ответа) по ролям; переопределяются env вида
+# CODER_AGENT_MAXTOK_PLANNER=4096 (план с tasks часто не влезает в 2500).
+_DEFAULT_MAXTOK = {"planner": 4096, "coder": 3000, "tester": 2000, "auditor": 2000}
+
+def _maxtok(role: str) -> int:
+    return int(os.environ.get("CODER_AGENT_MAXTOK_" + role.upper(),
+                              _DEFAULT_MAXTOK[role]))
+
 ROLES = {
-    "planner": RoleConfig("planner", MODEL_PLANNER, temperature=0.3, max_tokens=2500),
+    "planner": RoleConfig("planner", MODEL_PLANNER, temperature=0.3, max_tokens=_maxtok("planner")),
     "coder":   RoleConfig("coder",   MODEL_CODER, fallback_model=MODEL_FALLBACK_CODER,
-                          temperature=0.1, max_tokens=3000),
-    "tester":  RoleConfig("tester",  MODEL_TESTER, temperature=0.2, max_tokens=2000, think=True),
-    "auditor": RoleConfig("auditor", MODEL_TESTER, temperature=0.1, max_tokens=2000, think=True),
+                          temperature=0.1, max_tokens=_maxtok("coder")),
+    "tester":  RoleConfig("tester",  MODEL_TESTER, temperature=0.2, max_tokens=_maxtok("tester"), think=True),
+    "auditor": RoleConfig("auditor", MODEL_TESTER, temperature=0.1, max_tokens=_maxtok("auditor"), think=True),
 }
 
 # Жёсткий бюджет контекста (RTX 4060 8GB + 16GB RAM).

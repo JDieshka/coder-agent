@@ -254,12 +254,113 @@ def _truncate_to_last_complete_obj(text: str):
     return None
 
 
+def _salvage_plan_truncation(cleaned: str):
+    """Спасение ОБРЕЗАННОГО планового JSON {"plan_md": "...", "tasks": [...]}.
+
+    Типичный кейс: модель начинает отвечать с huge plan_md (структура проекта в
+    markdown с ```-блоками), упирается в num_predict и не доходит до "tasks".
+    Если tasks уже частично есть — берём полные элементы; иначе возвращаем
+    plan-объект без задач (roles попросит повторить коротким ответом)."""
+    pstart = cleaned.find('"plan_md"')
+    tstart = cleaned.find('"tasks"')
+    if pstart == -1 or tstart == -1 or tstart < pstart:
+        return None
+    # если после "tasks" нет '[' — массив ещё не начался
+    obr = cleaned.find("[", tstart)
+    if obr == -1:
+        return None
+    arr = _balanced_slice(cleaned, obr, "[", "]")
+    if arr is not None:
+        try:
+            parsed = _loads_maybe_repaired(arr)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list) and parsed and all(isinstance(x, dict) for x in parsed):
+            return {"tasks": parsed}
+    # оборванный массив: собираем только полные {...}-элементы задач
+    objs = []
+    i = obr + 1
+    while True:
+        s = cleaned.find("{", i)
+        if s == -1:
+            break
+        sl = _balanced_slice(cleaned, s, "{", "}")
+        if sl is None:
+            break
+        try:
+            o = _loads_maybe_repaired(sl)
+            if isinstance(o, dict) and ("title" in o or "id" in o):
+                objs.append(o)
+        except Exception:
+            pass
+        i = s + len(sl)
+    if objs:
+        return {"tasks": objs}
+    # задач нет вообще — это всё ещё валидный частичный ответ (план есть),
+    # но НЕ годится как план; помечаем, чтобы chat_json сделал укороченный ретрай
+    return None
+
+
+def _close_truncated_json(cleaned: str):
+    """Автозакрытие обрезанного JSON: режем до последней полной строки/элемента и
+    закрываем открытые { / [ . Лечит кейс planner, упёршегося в num_predict
+    посреди длинного планового текста."""
+    start = cleaned.find("{")
+    if start == -1:
+        return None
+    frag = cleaned[start:]
+    stack, in_str, esc = [], False, False
+    last_safe, last_stack = 0, []
+    for i, ch in enumerate(frag):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack and ((ch == "}" and stack[-1] == "{") or (ch == "]" and stack[-1] == "[")):
+                stack.pop()
+                last_safe, last_stack = i + 1, list(stack)
+    # конец после полной вершины (глубина 0) — это был валидный объект, его уже нашли выше
+    if not stack:
+        return None
+    cut = frag[:last_safe].rstrip().rstrip(",")
+    tail = "".join("]" if c == "[" else "}" for c in reversed(last_stack))
+    try:
+        obj = _loads_maybe_repaired(cut + tail)
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 def extract_json(text: str):
     """Достаёт первый валидный JSON-объект/массив из ответа модели.
 
     Устойчив к: markdown-обёрткам, пояснениям до/после JSON, литеральным \\n
     внутри строк кода, обрезанному ответу (заканчиваемся на ...)."""
     cleaned = re.sub(r"```(json|python)?", "", text)
+
+    # -1) приоритет объекту-обёртке {"plan_md"/"files"/"tasks"...}: если в тексте
+    #     есть JSON-ключи вида "ключ":, а не только markdown-списки, пробуем его
+    #     ДО поиска первого '[' (в plan_md часто встречается "[" как текст)
+    wrapped0, wpos0 = _find_wrapped_obj(cleaned)
+    if wrapped0 is not None and wrapped0.get("tasks"):
+        return wrapped0
+
+    # -2) обрезанный плановый ответ: {"plan_md": "...", "tasks": [ ... — сначала
+    #     спасаем полные элементы tasks, иначе ниже одиночная полная задача внутри
+    #     оборванного массива ложно считается целым ответом (регрессия qwen2.5 planner)
+    if '"plan_md"' in cleaned and '"tasks"' in cleaned:
+        salvaged0 = _salvage_plan_truncation(cleaned)
+        if salvaged0 is not None:
+            return salvaged0
 
     def _try_array_at(pos: int):
         """Если с позиции pos начинается массив файлов/задач — вернуть его."""
@@ -322,6 +423,21 @@ def extract_json(text: str):
         if nxt == start:
             break
         start = nxt
+    # 4b) ответ ОБРЕЗАН посреди незакрытой JSON-строки (частый кейс planner с длинным
+    #     plan_md): обрезаем до последней полной строки и закрываем открытые скобки.
+    #     Если при этом успел начаться массив tasks — спасаем полные элементы задач.
+    salvaged = _salvage_plan_truncation(cleaned)
+    if salvaged is not None:
+        return salvaged
+    closed = _close_truncated_json(cleaned)
+    if closed is not None and isinstance(closed, dict):
+        # объект-обёртка без "tasks" может быть ложным вложением внутри незакрытой
+        # JSON-строки (например, фрагмент дерева файлов из plan_md) — не считаем его ответом
+        if closed.get("tasks") or closed.get("files") or closed.get("new_tasks"):
+            return closed
+        wrapped_c, _ = _find_wrapped_obj(_repair_json(cleaned))
+        if wrapped_c is not None:
+            return wrapped_c
     # хвостовой шанс: JSON оборван лимитом токенов — собираем полные элементы
     trimmed = _truncate_to_last_complete_obj(cleaned)
     if trimmed is not None:
